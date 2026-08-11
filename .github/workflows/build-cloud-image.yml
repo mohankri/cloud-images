@@ -34,17 +34,6 @@ jobs:
             qemu-system-x86 qemu-utils cloud-image-utils \
             guestfs-tools libguestfs-tools ovmf
 
-      # ── REPLACE the old "Work around passt..." step WITH THIS ──
-      - name: Unconfine passt for libguestfs
-        run: |
-          sudo aa-teardown 2>/dev/null || true
-          sudo apt-get install -y passt
-          sudo ln -sf /etc/apparmor.d/usr.bin.passt /etc/apparmor.d/disable/ 2>/dev/null || true
-          sudo apparmor_parser -R /etc/apparmor.d/usr.bin.passt 2>/dev/null || true
-
-      - name: Work around passt/AppArmor on ubuntu-24.04 runners
-        run: sudo apt-get remove -y passt || true
-
       - name: Enable KVM on the runner
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -72,67 +61,63 @@ jobs:
           qemu-img create -f qcow2 -b "$IMG_BASE" -F qcow2 build.qcow2 20G
           qemu-img info build.qcow2
 
-      - name: Bake customizations into the image (virt-customize)
+      - name: Offline customizations (no appliance networking)
         env:
           LIBGUESTFS_BACKEND: direct
         run: |
-          sudo -E virt-customize -a build.qcow2 \
-            --install qemu-guest-agent,curl,jq \
-            --run-command 'systemctl enable qemu-guest-agent' \
-            --timezone UTC \
-            --truncate /etc/machine-id
+          sudo -E virt-customize -a build.qcow2 --timezone UTC
 
-      - name: Build cloud-init seed ISO
+      - name: Build bake seed ISO
         run: |
           mkdir -p seed
-          cp cloud-init/user-data seed/user-data 2>/dev/null || cat > seed/user-data <<'EOF'
+          if [ -f cloud-init/bake-user-data ]; then
+            cp cloud-init/bake-user-data seed/user-data
+          else
+            cat > seed/user-data <<'EOF'
           #cloud-config
-          hostname: ci-test
-          users:
-            - name: ci
-              sudo: ALL=(ALL) NOPASSWD:ALL
-              shell: /bin/bash
-              lock_passwd: false
-              plain_text_passwd: ci-test-only
-          ssh_pwauth: true
+          hostname: bake
+          packages:
+            - qemu-guest-agent
+            - curl
+            - jq
           runcmd:
-            - [sh, -c, "cloud-init status --wait > /dev/null"]
+            - systemctl enable qemu-guest-agent
+            - cloud-init clean --logs --machine-id
+            - poweroff
           EOF
+          fi
           cat > seed/meta-data <<EOF
-          instance-id: iid-ci-${{ github.run_id }}
-          local-hostname: ci-test
+          instance-id: iid-bake-${{ github.run_id }}
+          local-hostname: bake
           EOF
           cloud-localds seed.iso seed/user-data seed/meta-data
 
-      - name: Boot test under KVM
+      - name: Bake via first boot under KVM
         run: |
-          timeout 300 qemu-system-x86_64 \
+          timeout 600 qemu-system-x86_64 \
             -enable-kvm -machine q35 -cpu host \
             -m 2048 -smp 2 \
             -drive file=build.qcow2,if=virtio,format=qcow2 \
             -drive file=seed.iso,if=virtio,format=raw \
-            -netdev user,id=n0,hostfwd=tcp::2222-:22 \
-            -device virtio-net-pci,netdev=n0 \
-            -display none -serial file:console.log &
-          QPID=$!
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+            -display none -serial file:console.log \
+            -no-reboot
+          echo "--- bake completed, verifying ---"
+          grep -Eq "Cloud-init .* finished" console.log
 
-          for i in $(seq 1 60); do
-            if grep -q "ci-test login:" console.log 2>/dev/null || \
-               grep -q "Cloud-init .* finished" console.log 2>/dev/null; then
-              echo "boot OK after ~$((i*5))s"
-              kill $QPID; wait $QPID 2>/dev/null || true
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "::error::VM did not finish cloud-init within timeout"
-          tail -n 100 console.log
-          kill $QPID 2>/dev/null || true
-          exit 1
-
-      - name: Show boot log tail
+      - name: Show bake log tail
         if: always()
-        run: tail -n 40 console.log || true
+        run: tail -n 60 console.log || true
+
+      - name: Verify baked packages are in the image
+        env:
+          LIBGUESTFS_BACKEND: direct
+        run: |
+          sudo -E virt-cat -a build.qcow2 /var/lib/dpkg/status \
+            | grep -E "^Package: (qemu-guest-agent|curl|jq)$" | sort -u
+          count=$(sudo -E virt-cat -a build.qcow2 /var/lib/dpkg/status \
+            | grep -cE "^Package: (qemu-guest-agent|curl|jq)$")
+          [ "$count" -eq 3 ] || { echo "::error::expected 3 baked packages, found $count"; exit 1; }
 
       - name: Flatten and compress final image
         run: |
