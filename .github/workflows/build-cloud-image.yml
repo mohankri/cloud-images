@@ -1,0 +1,139 @@
+name: build-cloud-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloud-init/**"
+      - ".github/workflows/build-cloud-image.yml"
+  workflow_dispatch:
+    inputs:
+      ubuntu_release:
+        description: "Ubuntu release"
+        default: "24.04"
+        required: true
+
+env:
+  RELEASE: ${{ inputs.ubuntu_release || '24.04' }}
+  IMG_BASE: ubuntu-${{ inputs.ubuntu_release || '24.04' }}-server-cloudimg-amd64.img
+  MIRROR: https://cloud-images.ubuntu.com/releases
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils cloud-image-utils \
+            guestfs-tools libguestfs-tools ovmf
+
+      - name: Enable KVM on the runner
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Restore cached base image
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.IMG_BASE }}
+          key: cloudimg-${{ env.RELEASE }}-${{ github.run_id }}
+          restore-keys: cloudimg-${{ env.RELEASE }}-
+
+      - name: Download base image and verify checksum
+        run: |
+          curl -fsSLO --time-cond "$IMG_BASE" "$MIRROR/$RELEASE/release/$IMG_BASE"
+          curl -fsSL "$MIRROR/$RELEASE/release/SHA256SUMS" \
+            | grep " *$IMG_BASE\$" | sha256sum -c -
+
+      - name: Build layered qcow2
+        run: |
+          qemu-img create -f qcow2 -b "$IMG_BASE" -F qcow2 build.qcow2 20G
+          qemu-img info build.qcow2
+
+      - name: Bake customizations into the image (virt-customize)
+        env:
+          LIBGUESTFS_BACKEND: direct
+        run: |
+          sudo -E virt-customize -a build.qcow2 \
+            --install qemu-guest-agent,curl,jq \
+            --run-command 'systemctl enable qemu-guest-agent' \
+            --timezone UTC \
+            --truncate /etc/machine-id
+
+      - name: Build cloud-init seed ISO
+        run: |
+          mkdir -p seed
+          cp cloud-init/user-data seed/user-data 2>/dev/null || cat > seed/user-data <<'EOF'
+          #cloud-config
+          hostname: ci-test
+          users:
+            - name: ci
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              shell: /bin/bash
+              lock_passwd: false
+              plain_text_passwd: ci-test-only
+          ssh_pwauth: true
+          runcmd:
+            - [sh, -c, "cloud-init status --wait > /dev/null"]
+          EOF
+          cat > seed/meta-data <<EOF
+          instance-id: iid-ci-${{ github.run_id }}
+          local-hostname: ci-test
+          EOF
+          cloud-localds seed.iso seed/user-data seed/meta-data
+
+      - name: Boot test under KVM
+        run: |
+          timeout 300 qemu-system-x86_64 \
+            -enable-kvm -machine q35 -cpu host \
+            -m 2048 -smp 2 \
+            -drive file=build.qcow2,if=virtio,format=qcow2 \
+            -drive file=seed.iso,if=virtio,format=raw \
+            -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+            -device virtio-net-pci,netdev=n0 \
+            -display none -serial file:console.log &
+          QPID=$!
+
+          for i in $(seq 1 60); do
+            if grep -q "ci-test login:" console.log 2>/dev/null || \
+               grep -q "Cloud-init .* finished" console.log 2>/dev/null; then
+              echo "boot OK after ~$((i*5))s"
+              kill $QPID; wait $QPID 2>/dev/null || true
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::VM did not finish cloud-init within timeout"
+          tail -n 100 console.log
+          kill $QPID 2>/dev/null || true
+          exit 1
+
+      - name: Show boot log tail
+        if: always()
+        run: tail -n 40 console.log || true
+
+      - name: Flatten and compress final image
+        run: |
+          qemu-img convert -O qcow2 -c build.qcow2 "ubuntu-$RELEASE-custom.qcow2"
+          qemu-img info "ubuntu-$RELEASE-custom.qcow2"
+          sha256sum "ubuntu-$RELEASE-custom.qcow2" > "ubuntu-$RELEASE-custom.qcow2.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-${{ env.RELEASE }}-custom-${{ github.sha }}
+          path: |
+            ubuntu-${{ env.RELEASE }}-custom.qcow2
+            ubuntu-${{ env.RELEASE }}-custom.qcow2.sha256
+          retention-days: 14
