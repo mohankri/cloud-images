@@ -65,7 +65,7 @@ jobs:
         env:
           LIBGUESTFS_BACKEND: direct
         run: |
-          sudo -E virt-customize -a build.qcow2 --timezone UTC
+          sudo -E virt-customize --no-network -a build.qcow2 --timezone UTC
 
       - name: Build bake seed ISO
         run: |
