@@ -34,6 +34,14 @@ jobs:
             qemu-system-x86 qemu-utils cloud-image-utils \
             guestfs-tools libguestfs-tools ovmf
 
+      # ── REPLACE the old "Work around passt..." step WITH THIS ──
+      - name: Unconfine passt for libguestfs
+        run: |
+          sudo aa-teardown 2>/dev/null || true
+          sudo apt-get install -y passt
+          sudo ln -sf /etc/apparmor.d/usr.bin.passt /etc/apparmor.d/disable/ 2>/dev/null || true
+          sudo apparmor_parser -R /etc/apparmor.d/usr.bin.passt 2>/dev/null || true
+
       - name: Work around passt/AppArmor on ubuntu-24.04 runners
         run: sudo apt-get remove -y passt || true
 
